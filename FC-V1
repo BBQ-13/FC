@@ -1,0 +1,420 @@
+```
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/i2c.h"
+#include "driver/uart.h"
+#include "driver/adc.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_http_server.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "cJSON.h"
+#include "driver/spi_master.h"
+#include "esp_bmp280.h"
+
+// I2C Configuration (MPU6050 + BMP280)
+#define I2C_MASTER_SCL_IO    22
+#define I2C_MASTER_SDA_IO    21
+#define I2C_MASTER_NUM       I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ   100000
+#define MPU6050_ADDR         0x68
+
+// UART Configuration (GPS)
+#define UART_NUM             UART_NUM_2
+#define UART_TX_PIN          17
+#define UART_RX_PIN          16
+#define UART_BAUD_RATE       9600
+#define UART_BUF_SIZE        1024
+
+// Motor PWM Configuration
+#define MOTOR_1_PIN          15
+#define MOTOR_2_PIN          2
+#define MOTOR_3_PIN          4
+#define MOTOR_4_PIN          5
+#define SERVO_PIN            18
+#define LEDC_TIMER           LEDC_TIMER_0
+#define LEDC_MODE            LEDC_HIGH_SPEED_MODE
+#define LEDC_CHANNEL_1       LEDC_CHANNEL_0
+#define LEDC_CHANNEL_2       LEDC_CHANNEL_1
+#define LEDC_CHANNEL_3       LEDC_CHANNEL_2
+#define LEDC_CHANNEL_4       LEDC_CHANNEL_3
+#define LEDC_CHANNEL_SERVO   LEDC_CHANNEL_4
+#define LEDC_DUTY_RES        LEDC_TIMER_10_BIT
+#define LEDC_FREQ_HZ         1000
+#define SERVO_FREQ_HZ        50
+
+// Battery ADC
+#define BATTERY_ADC_PIN      34
+#define BATTERY_LOW_VOLTAGE  3.3
+
+// Wi-Fi Configuration
+#define WIFI_SSID            "ESP-DRONE"
+#define WIFI_PASS            "12345678"
+
+// PID Constants (Tune these)
+#define KP_PITCH             1.5
+#define KI_PITCH             0.2
+#define KD_PITCH             0.1
+#define KP_ROLL              1.5
+#define KI_ROLL              0.2
+#define KD_ROLL              0.1
+#define KP_ALTITUDE          2.0
+#define KI_ALTITUDE          0.3
+#define KD_ALTITUDE          0.15
+
+static const char *TAG = "ESP32_AUTONOMOUS_DRONE";
+
+// Global Variables
+static QueueHandle_t control_queue;
+static float pitch = 0.0, roll = 0.0, altitude = 0.0;
+static float pitch_error_sum = 0.0, roll_error_sum = 0.0, alt_error_sum = 0.0;
+static float last_pitch_error = 0.0, last_roll_error = 0.0, last_alt_error = 0.0;
+static uint32_t motor_pwm[4] = {0, 0, 0, 0};
+static bool head_lock = false;
+static bool gps_hold = false;
+static bool rth_active = false;
+static float home_lat = 0.0, home_lon = 0.0;
+static float current_lat = 0.0, current_lon = 0.0;
+static float target_altitude = 1.0; // Default 1m
+static esp_bmp280_handle_t bmp280;
+
+// MPU6050 Initialization
+void mpu6050_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+
+    uint8_t data[2] = {0x6B, 0x00}; // Disable sleep
+    i2c_master_write_to_device(I2C_MASTER_NUM, MPU6050_ADDR, data, 2, 1000 / portTICK_PERIOD_MS);
+}
+
+// BMP280 Initialization
+void bmp280_init(void) {
+    esp_err_t ret = esp_bmp280_init(I2C_MASTER_NUM, &bmp280);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BMP280 init failed: %s", esp_err_to_name(ret));
+    }
+}
+
+// GPS Initialization
+void gps_init(void) {
+    uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    uart_param_config(UART_NUM, &uart_config);
+    uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_NUM, UART_BUF_SIZE, 0, 0, NULL, 0);
+}
+
+// Motor and Servo Initialization
+void motor_servo_init(void) {
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_MODE,
+        .timer_num = LEDC_TIMER,
+        .duty_resolution = LEDC_DUTY_RES,
+        .freq_hz = LEDC_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    ledc_timer_config_t servo_timer = {
+        .speed_mode = LEDC_MODE,
+        .timer_num = LEDC_TIMER_1,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .freq_hz = SERVO_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&servo_timer);
+
+    ledc_channel_config_t ledc_channel[5] = {
+        {.gpio_num = MOTOR_1_PIN, .speed_mode = LEDC_MODE, .channel = LEDC_CHANNEL_1, .duty = 0},
+        {.gpio_num = MOTOR_2_PIN, .speed_mode = LEDC_MODE, .channel = LEDC_CHANNEL_2, .duty = 0},
+        {.gpio_num = MOTOR_3_PIN, .speed_mode = LEDC_MODE, .channel = LEDC_CHANNEL_3, .duty = 0},
+        {.gpio_num = MOTOR_4_PIN, .speed_mode = LEDC_MODE, .channel = LEDC_CHANNEL_4, .duty = 0},
+        {.gpio_num = SERVO_PIN, .speed_mode = LEDC_MODE, .channel = LEDC_CHANNEL_SERVO, .timer_sel = LEDC_TIMER_1, .duty = 0},
+    };
+    for (int i = 0; i < 5; i++) {
+        ledc_channel_config(&ledc_channel[i]);
+    }
+}
+
+// Update Motor PWM
+void motor_update(uint32_t m1, uint32_t m2, uint32_t m3, uint32_t m4) {
+    motor_pwm[0] = m1 > 1023 ? 1023 : (m1 < 0 ? 0 : m1);
+    motor_pwm[1] = m2 > 1023 ? 1023 : (m2 < 0 ? 0 : m2);
+    motor_pwm[2] = m3 > 1023 ? 1023 : (m3 < 0 ? 0 : m3);
+    motor_pwm[3] = m4 > 1023 ? 1023 : (m4 < 0 ? 0 : m4);
+
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_1, motor_pwm[0]);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_2, motor_pwm[1]);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_3, motor_pwm[2]);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_4, motor_pwm[3]);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_1);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_2);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_3);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_4);
+}
+
+// Servo Control for Drop
+void servo_drop(bool drop) {
+    uint32_t duty = drop ? 77 : 26; // 1.5ms (neutral) to 2ms (drop)
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_SERVO, duty);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_SERVO);
+}
+
+// Battery Voltage Monitoring
+float read_battery_voltage(void) {
+    uint32_t adc_reading = 0;
+    for (int i = 0; i < 10; i++) {
+        adc_reading += adc1_get_raw(ADC1_CHANNEL_6);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    adc_reading /= 10;
+    return (adc_reading * 3.3 / 4095.0) * 2.0; // Voltage divider (1:1)
+}
+
+// Wi-Fi Initialization
+void wifi_init(void) {
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .password = WIFI_PASS,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    esp_wifi_start();
+    ESP_LOGI(TAG, "Wi-Fi AP started: SSID:%s, Password:%s", WIFI_SSID, WIFI_PASS);
+}
+
+// Web Server Handlers
+static esp_err_t telemetry_handler(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "pitch", pitch);
+    cJSON_AddNumberToObject(root, "roll", roll);
+    cJSON_AddNumberToObject(root, "altitude", altitude);
+    cJSON_AddNumberToObject(root, "battery", read_battery_voltage());
+    cJSON_AddNumberToObject(root, "lat", current_lat);
+    cJSON_AddNumberToObject(root, "lon", current_lon);
+    char *json_str = cJSON_Print(root);
+    httpd_resp_send(req, json_str, strlen(json_str));
+    cJSON_Delete(root);
+    free(json_str);
+    return ESP_OK;
+}
+
+static esp_err_t control_handler(httpd_req_t *req) {
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret > 0) {
+        buf[ret] = '\0';
+        xQueueSend(control_queue, buf, 0);
+    }
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static void start_web_server(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server;
+    httpd_start(&server, &config);
+
+    httpd_uri_t telemetry = {
+        .uri = "/telemetry",
+        .method = HTTP_GET,
+        .handler = telemetry_handler,
+    };
+    httpd_register_uri_handler(server, &telemetry);
+
+    httpd_uri_t control = {
+        .uri = "/control",
+        .method = HTTP_POST,
+        .handler = control_handler,
+    };
+    httpd_register_uri_handler(server, &control);
+}
+
+// OTA Update Task
+void ota_task(void *pvParameters) {
+    // Implement OTA using esp_ota_ops.h
+    // Placeholder: Check for firmware updates via HTTP
+    vTaskDelete(NULL);
+}
+
+// GPS Parsing (NMEA)
+void parse_gps_nmea(char *nmea, float *lat, float *lon) {
+    if (strstr(nmea, "$GPGGA")) {
+        char *token = strtok(nmea, ",");
+        int i = 0;
+        while (token != NULL) {
+            if (i == 2) *lat = atof(token) / 100.0; // Latitude
+            if (i == 4) *lon = atof(token) / 100.0; // Longitude
+            token = strtok(NULL, ",");
+            i++;
+        }
+    }
+}
+
+// Flight Control Task
+void flight_control_task(void *pvParameters) {
+    float accel_x, accel_y, accel_z, gyro_x, gyro_y;
+    float base_thrust = 0.0, pitch_target = 0.0, roll_target = 0.0;
+    bool drop_trigger = false;
+    char control_data[256];
+
+    while (1) {
+        // Read MPU6050
+        uint8_t buffer[14];
+        uint8_t reg = 0x3B;
+        i2c_master_write_read_device(I2C_MASTER_NUM, MPU6050_ADDR, &reg, 1, buffer, 14, 1000 / portTICK_PERIOD_MS);
+        int16_t ax = (buffer[0] << 8) | buffer[1];
+        int16_t ay = (buffer[2] << 8) | buffer[3];
+        int16_t az = (buffer[4] << 8) | buffer[5];
+        int16_t gx = (buffer[8] << 8) | buffer[9];
+        int16_t gy = (buffer[10] << 8) | buffer[11];
+        accel_x = ax / 16384.0;
+        accel_y = ay / 16384.0;
+        accel_z = az / 16384.0;
+        gyro_x = gx / 131.0;
+        gyro_y = gy / 131.0;
+
+        // Read BMP280
+        float pressure, temperature;
+        esp_bmp280_read(bmp280, &pressure, &temperature, &altitude);
+
+        // Read GPS
+        uint8_t gps_data[UART_BUF_SIZE];
+        int len = uart_read_bytes(UART_NUM, gps_data, UART_BUF_SIZE - 1, 20 / portTICK_PERIOD_MS);
+        if (len > 0) {
+            gps_data[len] = '\0';
+            parse_gps_nmea((char *)gps_data, &current_lat, &current_lon);
+            if (home_lat == 0.0 && current_lat != 0.0) {
+                home_lat = current_lat;
+                home_lon = current_lon;
+            }
+        }
+
+        // Complementary Filter
+        pitch = 0.98 * (pitch + gyro_x * 0.01) + 0.02 * atan2(accel_y, accel_z);
+        roll = 0.98 * (roll + gyro_y * 0.01) + 0.02 * atan2(-accel_x, accel_z);
+
+        // Control Input
+        if (xQueueReceive(control_queue, control_data, 0)) {
+            cJSON *json = cJSON_Parse(control_data);
+            if (json) {
+                base_thrust = cJSON_GetObjectItem(json, "thrust")->valuedouble;
+                pitch_target = cJSON_GetObjectItem(json, "pitch")->valuedouble;
+                roll_target = cJSON_GetObjectItem(json, "roll")->valuedouble;
+                head_lock = cJSON_GetObjectItem(json, "head_lock")->valueint;
+                gps_hold = cJSON_GetObjectItem(json, "gps_hold")->valueint;
+                rth_active = cJSON_GetObjectItem(json, "rth")->valueint;
+                drop_trigger = cJSON_GetObjectItem(json, "drop")->valueint;
+                cJSON_Delete(json);
+            }
+        }
+
+        // Head-Lock Adjustment
+        float yaw = 0.0; // Placeholder: Compute from gyro or magnetometer
+        if (head_lock) {
+            float yaw_diff = yaw; // Relative to takeoff yaw
+            float new_pitch = pitch_target * cos(yaw_diff) + roll_target * sin(yaw_diff);
+            float new_roll = -pitch_target * sin(yaw_diff) + roll_target * cos(yaw_diff);
+            pitch_target = new_pitch;
+            roll_target = new_roll;
+        }
+
+        // GPS Hold and RTH
+        if (gps_hold || rth_active) {
+            float lat_error = (rth_active ? home_lat : current_lat) - current_lat;
+            float lon_error = (rth_active ? home_lon : current_lon) - current_lon;
+            pitch_target += lat_error * 0.1; // Simple proportional control
+            roll_target += lon_error * 0.1;
+        }
+
+        // PID Control
+        float pitch_error = pitch_target - pitch;
+        float roll_error = roll_target - roll;
+        float alt_error = target_altitude - altitude;
+        pitch_error_sum += pitch_error * 0.01;
+        roll_error_sum += roll_error * 0.01;
+        alt_error_sum += alt_error * 0.01;
+        float pitch_output = KP_PITCH * pitch_error + KI_PITCH * pitch_error_sum + KD_PITCH * (pitch_error - last_pitch_error) / 0.01;
+        float roll_output = KP_ROLL * roll_error + KI_ROLL * roll_error_sum + KD_ROLL * (roll_error - last_roll_error) / 0.01;
+        float alt_output = KP_ALTITUDE * alt_error + KI_ALTITUDE * alt_error_sum + KD_ALTITUDE * (alt_error - last_alt_error) / 0.01;
+        last_pitch_error = pitch_error;
+        last_roll_error = roll_error;
+        last_alt_error = alt_error;
+
+        // Motor Mixing
+        base_thrust += alt_output;
+        uint32_t m1 = (uint32_t)(base_thrust * 10.23 - pitch_output + roll_output); // Front-Left
+        uint32_t m2 = (uint32_t)(base_thrust * 10.23 - pitch_output - roll_output); // Front-Right
+        uint32_t m3 = (uint32_t)(base_thrust * 10.23 + pitch_output + roll_output); // Rear-Left
+        uint32_t m4 = (uint32_t)(base_thrust * 10.23 + pitch_output - roll_output); // Rear-Right
+
+        // Battery Check
+        float battery_voltage = read_battery_voltage();
+        if (battery_voltage < BATTERY_LOW_VOLTAGE) {
+            ESP_LOGW(TAG, "Low battery: %.2fV", battery_voltage);
+            motor_update(0, 0, 0, 0);
+            rth_active = true; // Trigger RTH
+        } else {
+            motor_update(m1, m2, m3, m4);
+        }
+
+        // Servo Drop
+        servo_drop(drop_trigger);
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); // 100 Hz
+    }
+}
+
+void app_main(void) {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
+    mpu6050_init();
+    bmp280_init();
+    gps_init();
+    motor_servo_init();
+    wifi_init();
+
+    control_queue = xQueueCreate(10, 256);
+    start_web_server();
+    xTaskCreate(ota_task, "ota_task", 8192, NULL, 5, NULL);
+    xTaskCreate(flight_control_task, "flight_control", 8192, NULL, 6, NULL);
+
+    ESP_LOGI(TAG, "ESP32 Autonomous Drone Initialized");
+}
+```
